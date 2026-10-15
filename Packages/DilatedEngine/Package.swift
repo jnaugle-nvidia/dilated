@@ -26,7 +26,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DilatedEngineTests",
-            dependencies: ["DilatedEngine"],
+            dependencies: ["DilatedEngine", "DilatedCore"],
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],

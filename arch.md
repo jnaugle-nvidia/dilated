@@ -1,7 +1,7 @@
 # Dilated — Architecture
 
 > **What this is:** a macOS game that trains eye speed for practical shooting (USPSA).
-> **Status:** Draft v0.3 · 2026-10-15 (changes in §20)
+> **Status:** Draft v0.4 · 2026-10-15 (changes in §20)
 > **Name:** Dilated. Code modules use the `Dilated` prefix.
 
 ---
@@ -157,7 +157,7 @@ dilated/                                ← repo root
     ├── DilatedCore/
     │   ├── Package.swift
     │   ├── Sources/DilatedCore/
-    │   │   ├── Models/             ← TrialSpec, Probe, ProbeOutcome, TrialEvaluation, PlayerInput, DrillID, ScoreZone
+    │   │   ├── Models/             ← TrialSpec, Probe, ProbeOutcome, TrialEvaluation, PlayerInput, DrillID, ScoreZone, RunOutcome
     │   │   ├── Drills/             ← one file per drill: generator + answer parser + evaluator
     │   │   ├── Adaptive/           ← Staircase.swift, Ladder.swift, AdaptivePolicy.swift
     │   │   ├── Scoring/            ← HitFactorScorer.swift, Stats.swift
@@ -167,7 +167,7 @@ dilated/                                ← repo root
     ├── DilatedEngine/
     │   ├── Package.swift
     │   ├── Sources/DilatedEngine/
-    │   │   ├── Runner/             ← TrialRunner.swift, DrillRunning.swift, DrillRegistry.swift, RunnerState.swift
+    │   │   ├── Runner/             ← TrialRunner.swift, DrillRunning.swift (+ DrillRegistry), RunSetup.swift (+ Presentation)
     │   │   ├── Rendering/          ← DrillScene.swift, TargetNode.swift, MaskNode.swift
     │   │   ├── Timing/             ← FrameClock.swift, SpriteKitFrameClock.swift, MetalFrameClock.swift, TimingSelfTest.swift
     │   │   ├── Input/              ← InputRouter.swift, KeyBindings.swift
@@ -486,57 +486,58 @@ stateDiagram-v2
 
 One `TrialRunner` drives one drill run. It is called **once per frame** and **once per input event**. It never uses `Timer` or `DispatchQueue.asyncAfter` for stimulus timing — everything counts frames.
 
+Each `onFrame` decides what that frame shows and publishes it as `presentation`. The scene reads `presentation` and `currentSpec` and draws; the runner never touches SpriteKit, so it is tested with a fake clock (§15.1).
+
 ```swift
 @MainActor @Observable
 public final class TrialRunner<Drill: DrillDefinition>: DrillRunning {
-    public private(set) var state: RunnerState = .idle
-    public private(set) var results: [TrialResult] = []   // kept in memory during the run
+    public init(drill: Drill, setup: RunSetup)
 
-    private let drill: Drill
-    private var staircase: Staircase?                      // nil for .fixed drills
-    private var rng: SeededRNG
-    private let scene: DrillScene
+    public private(set) var presentation: Presentation      // what this frame shows
+    public private(set) var currentSpec: TrialSpec<Drill.Stimulus, Drill.Response>?
+    public private(set) var trials: [TrialOutcome]          // every attempt, valid or not
+    public var onBeep: (() -> Void)?
 
-    public func onFrame(_ tick: FrameTick) { /* advance state by one frame */ }
-    public func onPresented(frameIndex: Int, presentedTime: Double) { /* fill in Onset.presented */ }
-    public func onInput(_ input: PlayerInput) { /* collect, parse, grade; uses input.timestamp */ }
+    public func start()                                     // STANDBY, random 1–3 s, beep
+    public func onFrame(_ tick: FrameTick)
+    public func onPresented(frameIndex: Int, presentedTime: Double)   // MetalFrameClock only
+    public func onInput(_ input: PlayerInput)
+    public func pause(), resume(), quit()
+    public func outcome() -> RunOutcome                     // once finished
+}
+
+public enum Presentation: Sendable, Equatable {
+    case blank, standby, fixation
+    case probe(index: Int, phase: ProbePhase)               // .visible, .masked, .awaiting
+    case feedback([ProbeOutcome])
+    case invalid(InvalidReason)                             // "False start", "Frames dropped"
+    case paused(PauseReason)                                // .player (Esc) or .tooManyInvalid
+    case finished
 }
 
 /// What the app holds. Lets one program run D1, D2 and D3 in a row without knowing their types.
 @MainActor
 public protocol DrillRunning: AnyObject {
     var drillID: DrillID { get }
+    var fitsScreen: Bool { get }
+    var presentation: Presentation { get }
     var isFinished: Bool { get }
-    func onFrame(_ tick: FrameTick)
-    func onPresented(frameIndex: Int, presentedTime: Double)
-    func onInput(_ input: PlayerInput)
-    func outcome() -> RunOutcome          // plain Sendable structs, stimulus already JSON-encoded
+    // plus start, onFrame, onPresented, onInput, pause, resume, quit, outcome
 }
 
-/// The only `switch` over drill IDs in the app.
+/// The only `switch` over drill IDs in the app. nil for drills not built yet.
 @MainActor
 public enum DrillRegistry {
-    public static func makeRunner(for id: DrillID, setup: RunSetup) -> any DrillRunning
-    // RunSetup: display geometry, screen fit, settings, seed, start difficulty
+    public static func makeRunner(for id: DrillID, setup: RunSetup) -> (any DrillRunning)?
 }
 
-public enum RunnerState: Sendable {
-    case idle
-    case standby(beepAt: Double)
-    case fixation(framesLeft: Int)
-    case stimulus(probe: Int, onset: Onset, framesLeft: Int)
-    case mask(probe: Int, onset: Onset, framesLeft: Int)
-    case awaitingResponse(probe: Int, onset: Onset, framesLeft: Int)
-    case feedback(framesLeft: Int)
-    case paused(reason: PauseReason)      // too many invalid trials, or Esc
-    case finished
-}
-
-public struct Onset: Sendable {
-    public var frameIndex: Int            // the frame where the probe first became visible
-    public var estimated: Double          // from the frame tick, known right away
-    public var presented: Double?         // real on-glass time, filled in later by MetalFrameClock
-    public var best: Double { presented ?? estimated }
+public struct RunSetup: Sendable {
+    public var geometry: DisplayGeometry
+    public var fit: ScreenFit
+    public var seed: UInt64
+    public var startDifficulty: Int
+    public var powerFactor: PowerFactor
+    public var timing: RunTiming     // standby 1–3 s, feedback 150 ms, invalid feedback 800 ms, pause after 3, abort after 10
 }
 
 public struct FrameTick: Sendable {
@@ -546,11 +547,15 @@ public struct FrameTick: Sendable {
 }
 ```
 
-At the end of a run, the runner returns a `RunOutcome`: plain `Sendable` structs, with each stimulus already encoded to JSON. The app passes it to `ResultsStore` (§11) in one call. No disk writes happen during trials, and SwiftData `@Model` objects never reach the runner.
+**How it counts frames.** Entering a state shows its first frame on the next tick. A probe's first visible frame is its onset: the runner stores that tick's `timestamp`, and replaces it if `onPresented` later reports the real on-glass time. Stimulus frames = `exposureFrames`, then `maskFrames`, then awaiting until `responseWindowFrames` after onset. An answer ends the probe; the next probe (D2) or feedback starts on the next frame.
+
+**Grading happens at the end of feedback**, so a late presented time can still move the onset or invalidate the trial. Invalid trials are recorded and replaced by a fresh trial at the same difficulty; they never reach the staircase. Pausing drops the trial in progress (it is not counted as invalid). A separate random generator times STANDBY, so pausing before the beep doesn't change which trials come.
+
+At the end of a run, the runner returns a `RunOutcome`: plain `Sendable` structs, with each stimulus already encoded to JSON. `RunOutcome` is defined in DilatedCore so DilatedData can save it without importing the engine. The app passes it to `ResultsStore` (§11) in one call. No disk writes happen during trials, and SwiftData `@Model` objects never reach the runner. Only finished runs carry a threshold.
 
 ### 8.3 Rendering
 
-1. One base class `DrillScene: SKScene`. Each drill subclasses it and builds its own nodes.
+1. One base class `DrillScene: SKScene`. Each drill subclasses it and builds its own nodes. In `update(_:)` it reads the runner's `presentation` and `currentSpec` and shows or hides nodes to match.
 2. **Create every node before the beep** and keep it hidden. Showing a stimulus = set `isHidden = false`. No new objects during trials.
 3. Preload all textures before the beep (`SKTexture.preload`).
 4. Run full screen. Hide the cursor during trials with `NSCursor.hide()` (except mouse drills).
@@ -1071,6 +1076,13 @@ Estimates assume one developer who knows basic Swift. Add ~50% if you are learni
 ---
 
 ## 20. Change log
+
+### v0.4 · 2026-10-15 — Trial runner built (Phase 1, step 2)
+
+- **The runner publishes, the scene pulls (§8.2):** `TrialRunner` exposes `presentation` and `currentSpec` instead of holding a `DrillScene`, so it is tested without SpriteKit. `RunnerState` and `Onset` became private details.
+- **`RunOutcome` lives in DilatedCore**, so DilatedData can save it without importing the engine (layer rule, §5).
+- **Grading at the end of feedback**, so late presented times still count. Only finished runs carry a threshold.
+- **`DrillRegistry.makeRunner` returns nil** for drills not built yet (D4–D7).
 
 ### v0.3 · 2026-10-15 — DilatedCore built (Phase 1, step 1)
 
