@@ -133,6 +133,8 @@ Rule of thumb: if code can be tested without a screen, it goes in **DilatedCore*
 ```text
 dilated/                                ← repo root
 ├── arch.md                             ← this file
+├── README.md
+├── LICENSE                             ← MIT
 ├── .gitignore
 ├── App/                                ← Xcode project (folder renamed from "Dilated", see §17)
 │   ├── Dilated.xcodeproj
