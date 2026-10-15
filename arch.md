@@ -1,7 +1,7 @@
 # Dilated — Architecture
 
 > **What this is:** a macOS game that trains eye speed for practical shooting (USPSA).
-> **Status:** Draft v0.2 · 2026-10-15 (changes in §20)
+> **Status:** Draft v0.3 · 2026-10-15 (changes in §20)
 > **Name:** Dilated. Code modules use the `Dilated` prefix.
 
 ---
@@ -202,9 +202,11 @@ public protocol DrillDefinition: Sendable {
     static var id: DrillID { get }
     static var version: Int { get }              // bump when trial generation or par changes
     var policy: AdaptivePolicy { get }           // staircase or fixed, plus the stop rule (§7.2)
+    var fitsScreen: Bool { get }                 // false if the easiest setting doesn't fit (§7.3)
+    func par(difficulty: Int) -> Double          // seconds (§7.4)
 
-    /// Build the next trial. `fit` says what the calibrated screen can show (§7.3).
-    func makeTrial(difficulty: Int, fit: ScreenFit, rng: inout SeededRNG) -> TrialSpec<Stimulus, Response>
+    /// Build the next trial. The drill already holds the display geometry and screen fit.
+    func makeTrial(difficulty: Int, rng: inout SeededRNG) -> TrialSpec<Stimulus, Response>
 
     /// Turn the inputs received so far for one probe into an answer.
     /// D4 returns `.incomplete` until it has both a letter and a direction.
@@ -223,7 +225,7 @@ public struct TrialSpec<Stimulus: Sendable & Codable, Response: Sendable & Codab
 
 public struct Probe<Response: Sendable & Codable & Equatable>: Sendable, Codable {
     public var expected: Response?               // nil = correct action is "do nothing" (no-shoot)
-    public var start: ProbeStart                 // .afterForeperiod or .afterPreviousAnswer
+    public var start: ProbeStart                 // .afterForeperiod or .afterPreviousProbe (answered or timed out)
     public var exposureFrames: Int               // how long this probe is visible
     public var maskFrames: Int
     public var responseWindowFrames: Int         // counted from this probe's onset
@@ -256,7 +258,7 @@ public struct TrialEvaluation: Sendable, Codable {
 
 ```swift
 public struct PlayerInput: Sendable, Codable {
-    public var action: PlayerAction              // .direction(Direction), .shoot, .letter(String), .click(xDeg:yDeg:)
+    public var action: PlayerAction              // .direction(Direction), .shoot, .letter(String), .click(DegreePoint)
     public var timestamp: Double                 // NSEvent.timestamp, system-uptime seconds
 }
 ```
@@ -266,14 +268,14 @@ public struct PlayerInput: Sendable, Codable {
 | Drill | Probes per trial | Next probe starts | An answer is | Staircase |
 |---|---|---|---|---|
 | D1 Flash Acquire | 1 | after the foreperiod | one arrow | yes, reports a threshold |
-| D2 Transition Ladder | one per target (3–8) | right after the previous answer | one arrow | yes, no threshold; an array is correct only if every target was read right |
+| D2 Transition Ladder | one per target (3–8) | right after the previous probe ends | one arrow | yes, no threshold; an array is correct only if every target was read right |
 | D3 No-Shoot | 1 | after the foreperiod | Space, or nothing | yes, with a false-alarm gate (§9) |
 | D4 Peripheral Pickup | 1 | after the foreperiod | a letter **and** a direction, either order | yes, reports a threshold |
 | D5 Mover Read | 1 (the E flash) | after the foreperiod, while the target moves | one arrow | yes, reports a threshold |
 | D6 Stage Scan | 1 | after the foreperiod | clicks, then Space to finish | yes, reports a threshold |
-| D7 Schulte Grid | 25 | right after the previous answer | a click on the right cell (wrong clicks before it are counted in the answer) | no — fixed grid size |
+| D7 Schulte Grid | 25 | right after the previous probe ends | a click on the right cell (wrong clicks before it are counted in the answer) | no — fixed grid size |
 
-`TrialRunner` is generic over the drill. The app never sees that type: it holds `any DrillRunning` (§8.2). Drill values are built per run with the display's geometry and the player's settings.
+`TrialRunner` is generic over the drill. The app never sees that type: it holds `any DrillRunning` (§8.2). Drill values are built per run with the display's geometry, the screen fit, and the player's settings.
 
 ### 7.2 Staircase and ladders (adaptive difficulty)
 
@@ -290,35 +292,47 @@ public struct PlayerInput: Sendable, Codable {
 2. Then **3-down / 1-up**: three right in a row → one step harder. One wrong → one step easier. This settles at ~79% correct.
 3. A **reversal** is when the direction changes (harder → easier, or easier → harder). The fast start's first wrong answer is reversal 1.
 4. Step size is 4 levels until 2 reversals have happened, then 1 level.
-5. Stop at the drill's stop rule. Default: 40 trials **or** 12 reversals, whichever comes first.
+5. Stop at the drill's stop rule. D1: 45 trials **or** 12 reversals, whichever comes first. (With 40, the simulated-player test in §15.1 showed only 85% of first sessions at 120 Hz reaching 4 small-step reversals; 45 gives 92–97%.)
 6. **Threshold** = geometric mean of the ladder values at the last 6 **small-step** reversals. The big-step reversals are too coarse to use.
    - With 4–5 small-step reversals, use those.
    - With fewer than 4, the run has no threshold. Save it, show "Not enough data for a threshold", and leave `threshold = nil`.
 7. The next session starts 8 levels (two big steps) easier than the last threshold, looked up on this display's ladder. The first session starts at level 0.
 
 ```swift
-public enum AdaptivePolicy: Sendable {
-    case staircase(ladder: Ladder, stop: StopRule, reportsThreshold: Bool)
+public enum AdaptivePolicy: Sendable, Codable {
+    case staircase(StaircaseConfig)
     case fixed(difficulty: Int, stop: StopRule)     // D7, warm-ups
 }
 
+public struct StaircaseConfig: Sendable, Codable {
+    public var levelCount: Int
+    public var thresholdLadder: Ladder?             // nil = no threshold reported (D2, D3)
+    public var stop: StopRule
+    public var gate: FalseAlarmGate?                // D3 (§9)
+}
+
 public struct StopRule: Sendable, Codable {
-    public var maxTrials: Int                       // e.g. 40 (D1), 10 arrays (D2), 1 grid (D7)
+    public var maxTrials: Int                       // e.g. 45 (D1), 10 arrays (D2), 60 (D3)
     public var maxReversals: Int?                   // e.g. 12; nil = trials only
 }
 
 public struct Staircase: Sendable, Codable {
     public private(set) var difficulty: Int
-    public private(set) var reversals: [Reversal] = []   // difficulty + step size at that moment
-    let ladder: Ladder
-    let stop: StopRule
-    var inFastStart = true
-    var streak = 0
-    var lastMove: Move? = nil          // .harder or .easier
+    public private(set) var reversals: [Reversal]   // level + step size used to approach it
 
-    public mutating func record(correct: Bool) { /* rules above */ }
-    public var isFinished: Bool { /* stop rule */ }
-    public var threshold: Double? { /* geometric mean of last 6 small-step reversals; nil if < 4 */ }
+    public mutating func record(correct: Bool, allowHarder: Bool = true)
+    public var isFinished: Bool
+    public func threshold(on ladder: Ladder) -> Double?   // nil if < 4 small-step reversals
+    public static func startDifficulty(lastThreshold: Double?, on ladder: Ladder) -> Int
+}
+
+/// What the runner holds: applies the policy, the false-alarm gate, and the stop rule.
+public struct AdaptiveTracker: Sendable, Codable {
+    public init(policy: AdaptivePolicy, startDifficulty: Int)
+    public mutating func record(_ evaluation: TrialEvaluation)
+    public var difficulty: Int
+    public var isFinished: Bool
+    public var threshold: Double?
 }
 ```
 
@@ -335,12 +349,15 @@ public struct DisplayGeometry: Sendable, Codable {
     public var minExposureFrames: Int            // from the slow-motion check (§15.2); default 1
 }
 
-/// Size on screen (points) for a size in degrees.
-/// points = 2 · distanceMM · tan(degrees / 2) · pointsPerMM
-public func points(forDegrees deg: Double, geometry: DisplayGeometry) -> Double {
-    2 * geometry.viewingDistanceMM * tan(deg * .pi / 360) * geometry.pointsPerMM
+public enum VisualAngle {
+    /// Size on screen of something `degrees` across: 2 · distanceMM · tan(degrees / 2) · pointsPerMM
+    public static func points(forDegrees degrees: Double, geometry: DisplayGeometry) -> Double
+    /// Position: a spot `degrees` off the line of sight sits distanceMM · tan(degrees) · pointsPerMM from center.
+    public static func offsetPoints(forDegrees degrees: Double, geometry: DisplayGeometry) -> Double
 }
 ```
+
+Positions are `DegreePoint`s: degrees from screen center, x to the right, y up.
 
 **Calibration steps (once per display):**
 
@@ -355,10 +372,12 @@ public func points(forDegrees deg: Double, geometry: DisplayGeometry) -> Double 
 ```swift
 /// What the screen can show, in degrees from screen center. Built from the drill view's real size,
 /// not the panel size: on notched MacBooks, full screen loses the strip beside the notch.
-public struct ScreenFit: Sendable {
+public struct ScreenFit: Sendable, Codable {
     public var halfWidthDeg: Double      // atan((viewWidthPoints / pointsPerMM / 2) / viewingDistanceMM)
     public var halfHeightDeg: Double
     public var marginDeg: Double = 1
+
+    public init(viewWidthPoints: Double, viewHeightPoints: Double, geometry: DisplayGeometry, marginDeg: Double = 1)
 }
 ```
 
@@ -369,7 +388,7 @@ public struct ScreenFit: Sendable {
 | 27″ Studio Display | 597 × 336 | 53° × 31° (±26.4°, ±15.6°) |
 
 1. Generators get the `ScreenFit` and place everything inside it, minus the margin.
-2. Each drill trims its difficulty range at runtime to what fits. Example: D2 at 5° spacing fits about 5–6 targets on a 14″ MacBook Pro, not 8. At 25° spacing, only 2–3 targets fit even on a 27″.
+2. Each drill trims its difficulty range at runtime to what fits. Example: at 600 mm, D2 keeps 11 of its 12 levels on a 14″ MacBook Pro (up to 8 targets with 18° transitions); its 25° level needs a larger display, and all 12 fit on a 27″.
 3. If a drill's easiest setting does not fit (e.g. D4 needs at least 6° in all 8 directions), the drill picker says "Sit closer or use a larger display" and shows the distance that would work: `distanceMM = halfHeightMM / tan(neededDeg)`.
 
 **Real-world scale mode:** the player types a target distance and spacing in yards. The app sizes targets to the same visual angle they would have on the range.
@@ -458,7 +477,7 @@ stateDiagram-v2
 2. **Stimulus** — the probe appears (in D1, the target and its E). Responses count from here.
 3. **Mask** — the E is covered by a pattern. The target silhouette stays.
 4. **Await response** — the player still has time to answer until the window ends.
-5. **Next probe** — in D2 and D7 the next probe starts as soon as the previous one is answered. Other drills have one probe per trial.
+5. **Next probe** — in D2 and D7 the next probe starts as soon as the previous one ends (answered, or its window ran out). Other drills have one probe per trial.
 6. **Feedback** — a short flash on the target: green ring = hit, red ✕ = miss. The shape carries the meaning, so color-blind players can read it.
 7. **False start** — a key press during fixation, or an answer faster than the probe's `minRTSeconds` (default 120 ms). Nobody reacts that fast, so it is a guess. The trial does not count and is put back in the queue.
 8. **Too many invalid trials** — after 3 invalid trials in a row (false starts or dropped frames), pause and say why: "Wait for the target" or "Frames are being dropped — close other apps". After 10 invalid trials in one run, end it with `endReason = "aborted"`. Aborted runs are saved but never count toward thresholds, PBs, or "vs last time".
@@ -655,12 +674,12 @@ Every drill uses the trial flow from §8.1 and the probe model from §7.1. Most 
 - **Input:** arrow key for the E's direction.
 - **Difficulty → value:** exposure on a log ladder from 500 ms (difficulty 0) down to the display's shortest exposure (§7.2). About 25 levels at 120 Hz, 19 at 60 Hz.
 - **Main score:** **Acquire threshold (ms)** — the exposure where you are right 79% of the time. Lower = faster eyes.
-- **Trials:** 40 per run (~2 min).
+- **Trials:** 45 per run (~2 min). 40 left too many first sessions without a threshold (§7.2).
 
 ### D2 — Transition Ladder (MVP)
 
 - **Trains:** target-to-target transitions with the eyes leading.
-- **Screen:** 3–8 silhouettes in a row or arc, numbered in shooting order. Only layouts that fit the screen are used (§7.3).
+- **Screen:** 3–8 silhouettes, numbered in shooting order. Each target is one *transition* (5°–25°) from the one before it, in a random direction, with no overlaps — like a stage array. Only levels that fit the screen are used (§7.3).
 - **Flow:**
   1. The array appears with a fixation cross on target 1. Wait a random foreperiod.
   2. An E appears on target 1. The first split starts here — not at the beep, which is never part of an RT (§8.4).
@@ -668,7 +687,7 @@ Every drill uses the trial flow from §8.1 and the probe model from §7.1. Most 
   4. A wrong answer counts as a miss; the sequence continues.
   5. After the last target, show the result.
 - **Input:** arrow keys.
-- **Difficulty → value:** a table of rows (target count, spacing 5°–25°, E exposure) from easy to hard, trimmed at runtime to the rows that fit the screen. The staircase moves through the rows. An array counts as correct only if every target was read right. D2 does not report a threshold.
+- **Difficulty → value:** 12 levels (target count, transition, E exposure), from 3 targets × 5° × 500 ms up to 8 × 25° × 160 ms (`TransitionLadder.allLevels`), trimmed at runtime to the levels that fit the screen. An array counts as correct only if every target was read right. D2 does not report a threshold.
 - **Main score:** **splits** shown like a shot timer (`1.12 | 0.31 | 0.29 | 0.34`), total time, and hit factor.
 - **Real-world mode:** build the array from distance and spacing in yards (§7.3).
 - **Stop rule:** 10 arrays per run (~3 min).
@@ -683,6 +702,7 @@ Every drill uses the trial flow from §8.1 and the probe model from §7.1. Most 
   - Levels 0–3: full targets, shrinking response window.
   - Levels 4–6: a no-shoot partly overlaps the shoot target.
   - Levels 7+: hard cover hides part of the target; shorter exposure.
+  - Exact values: `NoShootDiscriminator.levels` (window 1000 → 625 ms; overlap 25–55%; hard cover 25–45% with a 300 → 200 ms exposure). On overlap levels a shoot trial puts a no-shoot in front of the shoot target; a no-shoot trial shows two no-shoots.
 - **False-alarm gate:** the staircase steps harder only if the false-alarm rate over the last 10 no-shoot trials (or all so far, if fewer) is 20% or lower. Otherwise three right in a row keep the level. Without the gate, a player who presses on a third of the no-shoots is still 90% correct — enough to keep stepping harder.
 - **Main scores:** median RT on shoot targets, false-alarm rate (Space on a no-shoot), d′.
 - **Trials:** 60 per run (~3 min).
@@ -1051,6 +1071,12 @@ Estimates assume one developer who knows basic Swift. Add ~50% if you are learni
 ---
 
 ## 20. Change log
+
+### v0.3 · 2026-10-15 — DilatedCore built (Phase 1, step 1)
+
+- **D1 runs 45 trials, not 40** (§7.2, §9). The simulated-player test showed only 85% of first sessions at 120 Hz producing a threshold with 40; 45 gives 92–97% with the same accuracy.
+- **D2 arrays are random walks**, not rows (§9): each target is one transition from the last, in any direction. On a 14″ MacBook Pro at 600 mm, 11 of 12 levels fit (vs. about 3 with rows).
+- **API as built (§7.1–§7.3):** drills hold the screen fit, so `makeTrial(difficulty:rng:)` drops the `fit` argument; drills add `fitsScreen` and `par(difficulty:)`; `ProbeStart.afterPreviousProbe` (answered or timed out); `AdaptivePolicy.staircase(StaircaseConfig)` with the D3 gate inside it; `AdaptiveTracker` applies a policy over a run; `VisualAngle` is a namespace with size and position conversions; clicks carry a `DegreePoint`.
 
 ### v0.2 · 2026-10-15
 
