@@ -1,5 +1,9 @@
 import DilatedCore
 import Observation
+import os
+
+/// Why trials were thrown out. `log show --predicate 'subsystem == "Dilated.Engine"'`
+private let timingLog = Logger(subsystem: "Dilated.Engine", category: "timing")
 
 /// Drives one drill run, one frame and one input at a time (arch.md §8.1–§8.2).
 ///
@@ -183,7 +187,7 @@ public final class TrialRunner<Drill: DrillDefinition>: DrillRunning {
         switch state {
         case .fixation:
             if case .ignored = drill.parse([input], for: current.spec.probes[0]) { return }
-            invalidate(.falseStart)
+            invalidate(.falseStart, "key during fixation")
         case .probe(let index):
             let probe = current.spec.probes[index]
             let inputs = current.probes[index].inputs + [input]
@@ -191,7 +195,7 @@ public final class TrialRunner<Drill: DrillDefinition>: DrillRunning {
             if case .ignored = parse { return }
             // Pressed before the probe reached the screen, or faster than anyone can react: a guess.
             guard let onset = current.probes[index].onset, input.timestamp - onset >= probe.minRTSeconds else {
-                invalidate(.anticipation)
+                invalidate(.anticipation, "answer before the probe was on screen or under its minimum RT")
                 return
             }
             current.probes[index].inputs = inputs
@@ -213,7 +217,7 @@ public final class TrialRunner<Drill: DrillDefinition>: DrillRunning {
               var current = trial, current.serial == role.serial
         else { return }
         guard presentedTime > 0 else {
-            invalidate(.droppedFrame)   // that stimulus or mask frame never reached the glass
+            invalidate(.droppedFrame, "frame \(frameIndex) never reached the glass")
             return
         }
         var progress = current.probes[role.probe]
@@ -221,12 +225,13 @@ public final class TrialRunner<Drill: DrillDefinition>: DrillRunning {
             progress.presentedOnset = presentedTime
         }
         let maxGap = setup.timing.droppedFrameGap * frameSeconds
-        let gapTooLong = progress.lastPresented.map { presentedTime - $0 > maxGap } ?? false
+        let previousPresented = progress.lastPresented
+        let gapTooLong = previousPresented.map { presentedTime - $0 > maxGap } ?? false
         progress.lastPresented = presentedTime
         current.probes[role.probe] = progress
         trial = current
-        if gapTooLong {
-            invalidate(.droppedFrame)
+        if gapTooLong, let last = previousPresented {
+            invalidate(.droppedFrame, String(format: "presented %.1f ms after the previous stimulus frame", (presentedTime - last) * 1000))
         }
     }
 
@@ -328,7 +333,7 @@ public final class TrialRunner<Drill: DrillDefinition>: DrillRunning {
               case .probe(let index) = state, index == last.probe,
               tick.timestamp - lastTick.timestamp > setup.timing.droppedFrameGap * tick.duration
         else { return }
-        invalidate(.droppedFrame)
+        invalidate(.droppedFrame, String(format: "frame tick %.1f ms after the previous one", (tick.timestamp - lastTick.timestamp) * 1000))
     }
 
     private func standbyFrames() -> Int {
@@ -363,8 +368,9 @@ public final class TrialRunner<Drill: DrillDefinition>: DrillRunning {
         enter(.feedback(frames: setup.geometry.frames(forMS: setup.timing.feedbackMS)))
     }
 
-    private func invalidate(_ reason: InvalidReason) {
+    private func invalidate(_ reason: InvalidReason, _ detail: String) {
         guard var current = trial, current.invalidReason == nil else { return }
+        timingLog.notice("Trial \(current.serial) invalid (\(reason.rawValue, privacy: .public)): \(detail, privacy: .public)")
         current.invalidReason = reason
         trial = current
         // Already in feedback (a late presented time): the record will still say invalid.

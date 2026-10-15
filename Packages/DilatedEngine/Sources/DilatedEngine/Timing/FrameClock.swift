@@ -13,11 +13,17 @@ public struct FrameTick: Sendable, Equatable {
     }
 }
 
-/// Drives a runner once per frame. `SpriteKitFrameClock` and `MetalFrameClock` implement it (arch.md §8.4).
+/// Drives a session once per frame. `SpriteKitFrameClock` and `MetalFrameClock` implement it (arch.md §8.4).
+/// Drills don't change when the clock does.
 @MainActor
 public protocol FrameClock: AnyObject {
     var onTick: ((FrameTick) -> Void)? { get set }
     /// Real on-glass time for a frame, delivered after the fact. Only `MetalFrameClock` calls it.
     var onPresented: ((_ frameIndex: Int, _ presentedTime: Double) -> Void)? { get set }
     var nominalFrameDuration: Double { get }
+
+    /// Draw `scene` on every tick.
+    func attach(_ scene: DrillScene)
+    func start()
+    func stop()
 }

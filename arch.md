@@ -1,7 +1,7 @@
 # Dilated — Architecture
 
 > **What this is:** a macOS game that trains eye speed for practical shooting (USPSA).
-> **Status:** Draft v0.4 · 2026-10-15 (changes in §20)
+> **Status:** Draft v0.5 · 2026-10-15 (changes in §20)
 > **Name:** Dilated. Code modules use the `Dilated` prefix.
 
 ---
@@ -149,7 +149,7 @@ dilated/                                ← repo root
 │   │   │   ├── CalibrationView.swift
 │   │   │   └── SettingsView.swift
 │   │   └── Resources/
-│   │       ├── Assets.xcassets         ← target art, icons
+│   │       ├── Assets.xcassets         ← icons, TitleBackground (the eye key art)
 │   │       └── Sounds/                 ← beep.caf
 │   ├── DilatedTests/
 │   └── DilatedUITests/
@@ -167,8 +167,8 @@ dilated/                                ← repo root
     ├── DilatedEngine/
     │   ├── Package.swift
     │   ├── Sources/DilatedEngine/
-    │   │   ├── Runner/             ← TrialRunner.swift, DrillRunning.swift (+ DrillRegistry), RunSetup.swift (+ Presentation)
-    │   │   ├── Rendering/          ← DrillScene.swift, TargetNode.swift, MaskNode.swift
+    │   │   ├── Runner/             ← TrialRunner.swift, DrillRunning.swift (+ DrillRegistry), RunSetup.swift (+ Presentation), DrillSession.swift
+    │   │   ├── Rendering/          ← DrillScene.swift, SceneArt.swift, FlashAcquireScene.swift, TransitionLadderScene.swift, NoShootScene.swift
     │   │   ├── Timing/             ← FrameClock.swift, SpriteKitFrameClock.swift, MetalFrameClock.swift, TimingSelfTest.swift
     │   │   ├── Input/              ← InputRouter.swift, KeyBindings.swift
     │   │   └── Audio/              ← BeepPlayer.swift
@@ -555,7 +555,7 @@ At the end of a run, the runner returns a `RunOutcome`: plain `Sendable` structs
 
 ### 8.3 Rendering
 
-1. One base class `DrillScene: SKScene`. Each drill subclasses it and builds its own nodes. In `update(_:)` it reads the runner's `presentation` and `currentSpec` and shows or hides nodes to match.
+1. One base class `DrillScene: SKScene`; `FlashAcquireScene`, `TransitionLadderScene`, and `NoShootScene` subclass it. Each holds its typed runner, and `sync()` reads `presentation` and `currentSpec` and moves, rotates, and shows or hides nodes to match. `DrillScene` draws the shared frames (STANDBY, invalid, paused, done).
 2. **Create every node before the beep** and keep it hidden. Showing a stimulus = set `isHidden = false`. No new objects during trials.
 3. Preload all textures before the beep (`SKTexture.preload`).
 4. Run full screen. Hide the cursor during trials with `NSCursor.hide()` (except mouse drills).
@@ -598,7 +598,19 @@ public protocol FrameClock: AnyObject {
     /// Real on-glass time for a frame, delivered after the fact. Only MetalFrameClock calls it.
     var onPresented: ((_ frameIndex: Int, _ presentedTime: Double) -> Void)? { get set }
     var nominalFrameDuration: Double { get }
+    func attach(_ scene: DrillScene)    // draw this scene on every tick
+    func start()
+    func stop()
 }
+
+/// Wires a runner, its scene, and a clock: each tick runs `runner.onFrame`, then `scene.sync()`,
+/// before the frame is drawn. Also holds the ProcessInfo activity (rule 7).
+@MainActor
+public final class DrillSession {
+    public init(runner: any DrillRunning, scene: DrillScene, clock: any FrameClock)
+    public func start(), stop()
+}
+// DrillRegistry.makeSession(for:setup:clock:sceneSize:) builds the typed runner + scene pair.
 ```
 
 | Implementation | Who drives frames | Onset estimate (`FrameTick.timestamp`) | Real on-glass time | When to use |
@@ -616,6 +628,8 @@ drawable.addPresentedHandler { [weak self] drawable in
 ```
 
 The drills do not change when you swap clocks — only `DilatedEngine/Timing/` changes.
+
+**Timing log.** Every invalid trial is logged with its reason and the measured gap, e.g. `Trial 3 invalid (dropped_frame): presented 33.3 ms after the previous stimulus frame`. Read it with `/usr/bin/log show --predicate 'subsystem == "Dilated.Engine"'` (in zsh, plain `log` is a shell builtin).
 
 **Timing self-test (Calibration screen).** Part B always uses the Metal path, whatever clock the drills use, because it is the only way to see what really reached the glass.
 
@@ -861,7 +875,7 @@ Every drill uses the trial flow from §8.1 and the probe model from §7.1. Most 
 
 | Screen | Shows |
 |---|---|
-| **Home** | Today's program, big **Start** button, day streak, last 3 scores |
+| **Home** | Today's program, big **Start** button, day streak, last 3 scores, over the eye key art (`TitleBackground`): title on the upper lid, controls along the bottom, pupil left clear |
 | **Drill picker** | Every drill with its personal best. A drill that does not fit the screen says how close to sit (§7.3). |
 | **Session** | Full-screen drill view. HUD hidden during trials; shows only during rests |
 | **Results** | A / C / D / M / NS counts, points, time, hit factor, splits, threshold vs last time, vs recent form, **New PB** badges |
@@ -917,6 +931,8 @@ Every drill uses the trial flow from §8.1 and the probe model from §7.1. Most 
 | DilatedData | Round-trip with `ModelConfiguration(isStoredInMemoryOnly: true)` | Saved run reads back equal, in order after sorting by `order` / `index` |
 
 ### 15.2 Manual
+
+**Preview hook:** launch with `-previewDrill flashAcquire -previewClock metal` (any `DrillID`; `spriteKit` or `metal`) to start that drill straight from launch, with the display's own size estimate. Useful for screenshots and UI tests.
 
 1. Run the timing self-test on every Mac you support.
 2. **Slow-motion check:** film the screen and keyboard together with a phone at 240 fps.
@@ -1076,6 +1092,13 @@ Estimates assume one developer who knows basic Swift. Add ~50% if you are learni
 ---
 
 ## 20. Change log
+
+### v0.5 · 2026-10-15 — Frame clocks and drill scenes (Phase 1, step 3)
+
+- **`FrameClock` gained `attach(_:)`, `start()`, `stop()`** (§8.4), and **`DrillSession`** wires runner, scene, and clock.
+- **Both clocks run in the app.** Checked on a 14″ MacBook Pro whose display reported a 60 Hz maximum: D1–D3 render as specified on both clocks. Undisturbed, the Metal clock ran 40 s of D3 with no drops; with a screenshot taken every ~0.3 s it caught real dropped frames (33.3 ms gaps), invalidated three trials, and paused the run, as designed.
+- **Timing log** for invalid trials (§8.4) and a **preview launch hook** (§15.2).
+- **Home uses the eye key art** as its full-window background (§12).
 
 ### v0.4 · 2026-10-15 — Trial runner built (Phase 1, step 2)
 
