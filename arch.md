@@ -1014,7 +1014,13 @@ Estimates assume one developer who knows basic Swift. Add ~50% if you are learni
     git commit -m "Phase 0: project skeleton"
     ```
 
-    When the GitHub repo exists: `git remote add origin <repo URL>`, then `git push -u origin main`.
+13. Publish to GitHub (public, under `jnaugle-nvidia`):
+
+    ```bash
+    gh repo create jnaugle-nvidia/dilated --public --source . --remote origin --push
+    ```
+
+    The repo is at <https://github.com/jnaugle-nvidia/dilated>.
 
 ---
 
@@ -1039,7 +1045,6 @@ Estimates assume one developer who knows basic Swift. Add ~50% if you are learni
 | 5 | Par per drill and difficulty (§7.4) | Set from the first few weeks of real data, then freeze as drill version 1 |
 | 6 | Is the Metal-measured present latency a good stand-in for SKView's? | Use it; confirm with the slow-motion check (§15.2) |
 | 7 | D4 on laptops: allow down to 6°, or require sitting closer? | Largest that fits, minimum 6° |
-| 8 | GitHub repo | None yet — local repo only |
 
 ---
 
@@ -1058,4 +1063,4 @@ Estimates assume one developer who knows basic Swift. Add ~50% if you are learni
 - **Input (§8.5):** the monitor swallows handled events. Feedback uses shape as well as color.
 - **Data (§11):** `ProbeRecord`, `DrillRun.order` / `endReason`; CSV export is three files.
 - **Layout (§6):** `ProgressView.swift` → `TrainingProgressView.swift`; Xcode project lives in `App/`.
-- **Getting started (§17):** local `git init -b main`, Xcode folder setup, sandbox read/write, Games category, Swift 6 language mode, package tests. Phase 0 is done.
+- **Getting started (§17):** local `git init -b main`, Xcode folder setup, sandbox read/write, Games category, Swift 6 language mode, package tests. Phase 0 is done; the repo is public at github.com/jnaugle-nvidia/dilated.
